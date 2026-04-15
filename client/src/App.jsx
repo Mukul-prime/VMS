@@ -47,27 +47,42 @@ function App() {
   };
 
   // 🚀 Submit
-  const handleSubmit = async () => {
-    if (!validate() || !image) {
-      alert("Complete all steps properly!");
-      return;
-    }
+const handleSubmit = async () => {
+  if (!validate() || !image) {
+    alert("Complete all steps properly!");
+    return;
+  }
 
-    try {
-      await axios.post("http://localhost:5000/api/save", {
-        ...form,
-        image,
-      });
+  try {
+    // ✅ FIX: formData create karo
+    const formData = new FormData();
 
-      alert("Saved Successfully ✅");
+    // base64 image → file convert (IMPORTANT)
+    const blob = await fetch(image).then(res => res.blob());
+    const file = new File([blob], "capture.jpg", { type: "image/jpeg" });
 
-      setForm({ name: "", email: "" });
-      setImage(null);
-      setCameraOn(false);
-    } catch (err) {
-      console.error(err);
-    }
-  };
+    // append data
+    formData.append("Name", form.name);
+    formData.append("Email", form.email);
+    formData.append("Image", file);
+
+    await axios.post(
+      "http://127.0.0.1:8000/create-user/",
+      formData,
+      
+    );
+    console.log(file);
+    
+
+    alert("Saved Successfully ✅");
+
+    setForm({ name: "", email: "" });
+    setImage(null);
+    setCameraOn(false);
+  } catch (err) {
+    console.error(err);
+  }
+};
 
   const isEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email);
 

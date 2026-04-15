@@ -4,4 +4,7 @@ pip install mysqlclient
 pip install face-recognition
 pip install pillow
 pip install opencv-python
+pip install django-cors-headers
+
+
 
