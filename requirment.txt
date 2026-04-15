@@ -1,16 +1,7 @@
-
 pip install django
-
 pip install djangorestframework
-
 pip install mysqlclient
-
 pip install face-recognition
-
 pip install pillow
-<<<<<<< HEAD
-
-
 pip install opencv-python
-=======
->>>>>>> db741413b20032d11ac7f79f5a6095143d9d27bf
+
