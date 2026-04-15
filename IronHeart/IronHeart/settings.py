@@ -41,6 +41,8 @@ INSTALLED_APPS = [
 EXTERNAL_APPS = [
     "UserData",
     "rest_framework",
+    "Objects",
+    "Camera"
 ]
 INSTALLED_APPS += EXTERNAL_APPS
 

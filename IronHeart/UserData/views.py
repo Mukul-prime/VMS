@@ -21,7 +21,7 @@ def create_user_data(request):
     if image_file:
         image_file.seek(0)
         face_data = image_to_encoding_string(image_file)
-        image_file.seek(0)  # 🔥 MUST
+        image_file.seek(0)
 
     data = request.data.copy()
     data['FaceEncoding'] = face_data
@@ -34,5 +34,4 @@ def create_user_data(request):
             "message": "User created successfully",
             "check": True
         })
-
     return Response(serializer.errors)
