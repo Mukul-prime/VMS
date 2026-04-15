@@ -17,11 +17,12 @@ def create_user_data(request):
         })
 
     image_file = request.FILES.get("Image")
-
+    print(image_file)
     if image_file:
         image_file.seek(0)
         face_data = image_to_encoding_string(image_file)
         image_file.seek(0)
+        print(image_file)
 
     data = request.data.copy()
     data['FaceEncoding'] = face_data
