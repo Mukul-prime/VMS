@@ -41,7 +41,8 @@ INSTALLED_APPS = [
 EXTERNAL_APPS = [
     "UserData",
     "rest_framework",
-    "Objects"
+    "Objects",
+    "Camera"
 ]
 INSTALLED_APPS += EXTERNAL_APPS
 
@@ -84,7 +85,7 @@ DATABASES = {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'VMSD',
         'USER': 'root',
-        'PASSWORD': 'Monu@12345',
+        'PASSWORD': 'root',
         'HOST': 'localhost',
         'PORT': '3306',
     }

@@ -34,5 +34,4 @@ def create_user_data(request):
             "message": "User created successfully",
             "check": True
         })
-
     return Response(serializer.errors)
