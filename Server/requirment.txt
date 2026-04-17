@@ -5,7 +5,8 @@ pip install face-recognition
 pip install pillow
 pip install opencv-python
 pip install django-cors-headers
-hello 
+pip install deep-sort-realtime
+pip install ultralytics
 
 
 

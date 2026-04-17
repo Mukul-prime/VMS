@@ -78,6 +78,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "IronHeart.wsgi.application"
 
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
@@ -87,7 +88,7 @@ DATABASES = {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'VMSD',
         'USER': 'root',
-        'PASSWORD': 'root',
+        'PASSWORD': 'Monu@12345',
         'HOST': 'localhost',
         'PORT': '3306',
     }
