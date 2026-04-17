@@ -1,8 +1,0 @@
- CAMERAS = [
-        {"id": 1, "name": "Camera 4", "rtsp_url": "rtsp://admin:Pratikshat%40123%23@192.168.1.111:554/stream1"},
-        {"id": 2, "name": "Camera 2", "rtsp_url": "rtsp://admin:Pratikshat%40123%23@192.168.1.112:554/stream1"},
-        {"id": 3, "name": "Camera 3", "rtsp_url": "rtsp://admin:Pratikshat%40123%23@192.168.1.113:554/stream1"},
-        {"id": 4, "name": "Camera 6", "rtsp_url": "rtsp://admin:noida%40122@192.168.1.114:554/stream1"},
-        {"id": 5, "name": "Camera 5", "rtsp_url": "rtsp://admin:NOIDA%40122@192.168.1.115:554/stream1"},
-        {"id": 6, "name": "Camera 1", "rtsp_url": "rtsp://admin:noida%40122@192.168.1.116:554/stream1"},
-    ]

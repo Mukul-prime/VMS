@@ -13,3 +13,37 @@ class CreateCamera(models.Model):
 
     class Meta:
         db_table = "Cameras"
+
+
+
+class Persons(models.Model):
+    created = models.DateTimeField(auto_now_add=True)
+    date = models.DateField(null=True, blank=True)
+
+    count = models.IntegerField(default=0)   # 🔥 ADD THIS
+
+    Cam_ids = models.ForeignKey(
+        CreateCamera,
+        on_delete=models.CASCADE
+    )
+
+    class Meta:
+        db_table = "Persons"
+        unique_together = ('Cam_ids', 'date')
+
+    def __str__(self):
+        return f"{self.Cam_ids} | {self.date} | {self.count}"
+
+
+
+#
+# class Objects(models.Model):
+#     Id = models.AutoField(primary_key=True)
+#     created = models.DateTimeField(auto_now_add=True)
+#     count = models.IntegerField(default=0)
+#
+#
+#
+#     class Meta:
+#         db_table = "ObjectsPhaser"
+
