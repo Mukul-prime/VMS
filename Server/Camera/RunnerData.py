@@ -1,170 +1,258 @@
-import cv2
+import os
 import threading
-from ultralytics import YOLO
-from deep_sort_realtime.deepsort_tracker import DeepSort
-from .models import Persons, CreateCamera
 import time
-from django.utils.timezone import now
-from django.db import close_old_connections
 import traceback
+
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+import cv2
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from django.db import close_old_connections
+from django.utils.timezone import now
+from ultralytics import YOLO
+
+from .models import CreateCamera, Persons
+
+
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+
+CAPTURE_BACKEND = getattr(cv2, "CAP_FFMPEG", 0)
+CAPTURE_BUFFER_SIZE = 1
+CAPTURE_RETRY_DELAY_SEC = 2.0
+FRAME_WAIT_SEC = 0.05
+READ_FAILURE_LIMIT = 20
+SAVE_INTERVAL_SEC = 2.0
+TRACK_MAX_AGE = 40
+PERSON_CONFIDENCE = 0.25
 
 camera_flags = {}
 
+
+def _wait_or_stop(stop_event, seconds):
+    return stop_event.wait(seconds)
+
+
+def _camera_running(cam_id, stop_event):
+    return camera_flags.get(cam_id, False) and not stop_event.is_set()
+
+
+def _create_capture(rtsp_url):
+    capture = cv2.VideoCapture(rtsp_url, CAPTURE_BACKEND)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, CAPTURE_BUFFER_SIZE)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"RTSP stream open failed: {rtsp_url}")
+    return capture
+
+
 def runner(rtsp_url, cam_id):
-
-    CONF_YOLO = 0.25   # 🔥 improved detection
-
     latest_frame = None
-    lock = threading.Lock()
+    latest_frame_id = 0
     person_ids = []
+    frame_lock = threading.Lock()
+    stop_event = threading.Event()
 
     camera_flags[cam_id] = True
 
     yolo = YOLO("yolov8m.pt")
-    tracker = DeepSort(max_age=40)
+    tracker = DeepSort(max_age=TRACK_MAX_AGE)
 
-    # ===============================
-    # THREAD 1: CAPTURE
-    # ===============================
     def capture():
-        nonlocal latest_frame
-        cap = cv2.VideoCapture(rtsp_url)
+        nonlocal latest_frame, latest_frame_id
 
-        while camera_flags.get(cam_id, False):
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            with lock:
-                latest_frame = frame.copy()
-
-        cap.release()
-
-    # ===============================
-    # THREAD 2: DETECT + DB UPDATE
-    # ===============================
-    def detect():
-        nonlocal latest_frame, person_ids
-
-        last_save = 0
-        smoothed_count = 0
-
-        while camera_flags.get(cam_id, False):
+        while _camera_running(cam_id, stop_event):
+            capture_handle = None
             try:
-                if latest_frame is None:
+                capture_handle = _create_capture(rtsp_url)
+                print(f"[capture] Camera {cam_id} connected", flush=True)
+                read_failures = 0
+
+                while _camera_running(cam_id, stop_event):
+                    ret, frame = capture_handle.read()
+                    if not ret or frame is None:
+                        read_failures += 1
+                        if read_failures >= READ_FAILURE_LIMIT:
+                            print(
+                                f"[capture] Camera {cam_id} reconnecting after read failures",
+                                flush=True,
+                            )
+                            break
+                        _wait_or_stop(stop_event, FRAME_WAIT_SEC)
+                        continue
+
+                    read_failures = 0
+                    with frame_lock:
+                        latest_frame = frame.copy()
+                        latest_frame_id += 1
+            except Exception as exc:
+                print(f"[capture] Camera {cam_id} error: {exc}", flush=True)
+                traceback.print_exc()
+            finally:
+                if capture_handle is not None:
+                    capture_handle.release()
+
+            if _camera_running(cam_id, stop_event):
+                _wait_or_stop(stop_event, CAPTURE_RETRY_DELAY_SEC)
+
+    def detect():
+        nonlocal latest_frame, latest_frame_id, person_ids
+
+        last_frame_id = 0
+        last_save = 0.0
+        last_detected_count = None
+
+        while _camera_running(cam_id, stop_event):
+            try:
+                with frame_lock:
+                    frame_id = latest_frame_id
+                    frame = None if latest_frame is None else latest_frame.copy()
+
+                if frame is None or frame_id == last_frame_id:
+                    _wait_or_stop(stop_event, FRAME_WAIT_SEC)
                     continue
 
-                with lock:
-                    frame = latest_frame.copy()
-
+                last_frame_id = frame_id
                 results = yolo(frame, verbose=False)[0]
-
                 detections = []
 
                 for box in results.boxes:
                     conf = float(box.conf[0])
                     cls = int(box.cls[0])
-                    label = yolo.names[cls]
+                    label = str(yolo.names[cls])
 
-                    if label != "person" or conf < CONF_YOLO:
+                    if label != "person" or conf < PERSON_CONFIDENCE:
                         continue
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    w, h = x2 - x1, y2 - y1
-
-                    detections.append(([x1, y1, w, h], conf, "person"))
-
-                print("YOLO detections:", len(detections))  # 🔍 DEBUG
+                    width = x2 - x1
+                    height = y2 - y1
+                    detections.append(([x1, y1, width, height], conf, "person"))
 
                 tracks = tracker.update_tracks(detections, frame=frame)
+                current_ids = []
 
-                temp_ids = []
-
-                for t in tracks:
-                    # 🔥 FIX: no strict confirmation
-                    if t.time_since_update > 2:
+                for track in tracks:
+                    if track.time_since_update > 2:
                         continue
-                    temp_ids.append(t.track_id)
+                    current_ids.append(track.track_id)
 
-                with lock:
-                    person_ids = temp_ids
+                with frame_lock:
+                    person_ids = current_ids
 
-                # 🔥 HYBRID COUNT (BEST)
-                current_count = max(len(detections), len(set(person_ids)))
-
-                # smoothing
-                alpha = 0.4
-                smoothed_count = int(
-                    alpha * current_count + (1 - alpha) * smoothed_count
+                current_count = max(len(detections), len(set(current_ids)))
+                previous_count = (
+                    last_detected_count if last_detected_count is not None else 0
+                )
+                last_detected_count = current_count
+                print(
+                    (
+                        f"[detect] Camera {cam_id} "
+                        f"current: {current_count} previous: {previous_count}"
+                    ),
+                    flush=True,
                 )
 
-                print(f"👤 Cam {cam_id} Count: {smoothed_count}")
+                if time.time() - last_save < SAVE_INTERVAL_SEC:
+                    continue
 
-                # ===============================
-                # 🔥 DB SAVE
-                # ===============================
-                if time.time() - last_save > 2:
-                    last_save = time.time()
+                last_save = time.time()
+                today = now().date()
+                close_old_connections()
 
-                    today = now().date()
+                cam = CreateCamera.objects.filter(Cam_id=cam_id).first()
+                if cam is None:
+                    print(f"[detect] Camera {cam_id} missing in database", flush=True)
+                    continue
 
-                    close_old_connections()
-
-                    try:
-                        cam = CreateCamera.objects.get(Cam_id=cam_id)
-                        print("✅ Camera Found:", cam)
-                    except CreateCamera.DoesNotExist:
-                        print("❌ Camera not found:", cam_id)
-                        continue
-
-                    Persons.objects.update_or_create(
-                        Cam_ids=cam,
-                        date=today,
-                        defaults={"count": smoothed_count}
-                    )
-
-                    print(f"💾 Saved → Cam {cam_id} | {today} | {smoothed_count}")
-
-            except Exception as e:
-                print("❌ ERROR:", e)
+                Persons.objects.update_or_create(
+                    Cam_ids=cam,
+                    date=today,
+                    defaults={
+                        "count": current_count,
+                        "previous": previous_count,
+                    },
+                )
+                print(
+                    (
+                        f"[detect] Camera {cam_id} saved current {current_count} "
+                        f"previous {previous_count} for {today}"
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[detect] Camera {cam_id} error: {exc}", flush=True)
                 traceback.print_exc()
+                _wait_or_stop(stop_event, FRAME_WAIT_SEC)
 
-    # ===============================
-    # THREAD 3: DISPLAY
-    # ===============================
     def display():
-        nonlocal latest_frame, person_ids
+        nonlocal latest_frame, latest_frame_id, person_ids
 
         window_name = f"Camera {cam_id}"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        last_frame_id = 0
+        window_ready = False
 
-        while camera_flags.get(cam_id, False):
-            if latest_frame is None:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            window_ready = True
+        except Exception as exc:
+            print(f"[display] Camera {cam_id} window disabled: {exc}", flush=True)
+
+        while _camera_running(cam_id, stop_event):
+            with frame_lock:
+                frame_id = latest_frame_id
+                frame = None if latest_frame is None else latest_frame.copy()
+                current_ids = list(set(person_ids))
+
+            if frame is None or frame_id == last_frame_id:
+                _wait_or_stop(stop_event, FRAME_WAIT_SEC)
                 continue
 
-            with lock:
-                frame = latest_frame.copy()
-                ids = list(set(person_ids))
+            last_frame_id = frame_id
 
-            cv2.putText(frame, f"Persons: {len(ids)}",
-                        (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 255),
-                        2)
+            if not window_ready:
+                _wait_or_stop(stop_event, FRAME_WAIT_SEC)
+                continue
+
+            cv2.putText(
+                frame,
+                f"Persons: {len(current_ids)}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
 
             cv2.imshow(window_name, frame)
-
             if cv2.waitKey(1) & 0xFF == 27:
+                camera_flags[cam_id] = False
+                stop_event.set()
                 break
 
-        cv2.destroyWindow(window_name)
+        if window_ready:
+            cv2.destroyWindow(window_name)
 
-    # ===============================
-    # START THREADS
-    # ===============================
-    print(f"🚀 Camera {cam_id} Started")
+    print(f"[runner] Camera {cam_id} started", flush=True)
 
-    threading.Thread(target=capture, daemon=True).start()
-    threading.Thread(target=detect, daemon=True).start()
-    threading.Thread(target=display, daemon=True).start()
+    threads = [
+        threading.Thread(target=capture, daemon=True, name=f"camera-{cam_id}-capture"),
+        threading.Thread(target=detect, daemon=True, name=f"camera-{cam_id}-detect"),
+        threading.Thread(target=display, daemon=True, name=f"camera-{cam_id}-display"),
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    try:
+        while _camera_running(cam_id, stop_event):
+            time.sleep(0.2)
+    finally:
+        camera_flags[cam_id] = False
+        stop_event.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        print(f"[runner] Camera {cam_id} stopped", flush=True)
