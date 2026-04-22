@@ -1,5 +1,8 @@
 from django.db import models
 
+from UserData.models import UserD
+
+
 # Create your models here.
 class CreateCamera(models.Model):
     Cam_id = models.AutoField(primary_key=True)
@@ -15,12 +18,13 @@ class CreateCamera(models.Model):
         db_table = "Cameras"
 
 
-
+# this for person detection model save data
 class Persons(models.Model):
     created = models.DateTimeField(auto_now_add=True)
     date = models.DateField(null=True, blank=True)
 
-    count = models.IntegerField(default=0)   # 🔥 ADD THIS
+    count = models.IntegerField(default=0)
+    previous = models.IntegerField(default=0)
 
     Cam_ids = models.ForeignKey(
         CreateCamera,
@@ -33,17 +37,4 @@ class Persons(models.Model):
 
     def __str__(self):
         return f"{self.Cam_ids} | {self.date} | {self.count}"
-
-
-
-#
-# class Objects(models.Model):
-#     Id = models.AutoField(primary_key=True)
-#     created = models.DateTimeField(auto_now_add=True)
-#     count = models.IntegerField(default=0)
-#
-#
-#
-#     class Meta:
-#         db_table = "ObjectsPhaser"
 

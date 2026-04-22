@@ -16,16 +16,42 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(name, default=None):
+    value = os.getenv(name)
+    if value is None:
+        return list(default or [])
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def normalize_origins(origins):
+    normalized = []
+    for origin in origins:
+        cleaned = origin.strip().strip("'\"").rstrip("/")
+        if cleaned:
+            normalized.append(cleaned)
+    return normalized
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-+6mkavww#95$9+86$t)%aj5e1f(_5ph#$-x1%-^*6o4e-y(m$i"
+SECRET_KEY = os.getenv(
+    "DJANGO_SECRET_KEY",
+    "s%se9j^0ep!3nacub9qy^=8_=r45m$1(5=c)6w8_v#4z$f8l+p",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_bool("DJANGO_DEBUG", True)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ["localhost", "127.0.0.1"])
 
 
 # Application definition
@@ -41,7 +67,7 @@ INSTALLED_APPS = [
 EXTERNAL_APPS = [
     "UserData",
     "rest_framework",
-    "Objects",
+    "ObjectDetectors",
     "Camera",
     "corsheaders",
 ]
@@ -83,19 +109,19 @@ WSGI_APPLICATION = "IronHeart.wsgi.application"
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'VMSD',
-        'USER': 'root',
-        'PASSWORD': 'root',
-        'HOST': 'localhost',
-        'PORT': '3306',
+    "default": {
+        "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.mysql"),
+        "NAME": os.getenv("DB_NAME", "VMSD"),
+        "USER": os.getenv("DB_USER", "root"),
+        "PASSWORD": os.getenv("DB_PASSWORD", "root"),
+        "HOST": os.getenv("DB_HOST", "localhost"),
+        "PORT": os.getenv("DB_PORT", "3306"),
     }
 }
 
 
-MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
@@ -121,7 +147,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = "en-us"
 
-TIME_ZONE = "UTC"
+TIME_ZONE = "Asia/Kolkata"
 
 USE_I18N = True
 
@@ -134,11 +160,37 @@ USE_TZ = True
 STATIC_URL = "static/"
 
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
+CORS_ALLOWED_ORIGINS = normalize_origins(
+    env_list(
+        "CORS_ALLOWED_ORIGINS",
+        ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"],
+    )
+)
+CORS_ALLOW_HEADERS = [
+    "content-type",
+    "authorization",
 ]
 
-CORS_ALLOW_HEADERS = [
-    'content-type',
-    'authorization',
-]
+CSRF_TRUSTED_ORIGINS = normalize_origins(
+    env_list("CSRF_TRUSTED_ORIGINS", CORS_ALLOWED_ORIGINS)
+)
+
+if DEBUG:
+    SECURE_HSTS_SECONDS = 0
+    SECURE_SSL_REDIRECT = False
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+else:
+    SECURE_HSTS_SECONDS = int(os.getenv("DJANGO_SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
+        "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS",
+        True,
+    )
+    SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", True)
+    SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+ALLOWED_HOSTS = ['*']
