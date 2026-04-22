@@ -36,6 +36,32 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 3.0
 ZOOM_STEP = 0.1
 
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
+import cv2
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from django.db import close_old_connections
+from django.utils.timezone import now
+from ultralytics import YOLO
+
+from .models import CreateCamera, Persons
+
+
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
+
+CAPTURE_BACKEND = getattr(cv2, "CAP_FFMPEG", 0)
+CAPTURE_BUFFER_SIZE = 1
+CAPTURE_RETRY_DELAY_SEC = 2.0
+FRAME_WAIT_SEC = 0.05
+READ_FAILURE_LIMIT = 20
+SAVE_INTERVAL_SEC = 2.0
+TRACK_MAX_AGE = 40
+PERSON_CONFIDENCE = 0.25
+
 camera_flags = {}
 camera_zoom_levels = {}
 zoom_lock = threading.Lock()

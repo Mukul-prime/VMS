@@ -5,5 +5,6 @@ pip install face-recognition
 pip install pillow
 pip install opencv-python
 pip install django-cors-headers
+pip install deep-sort-realtime
 pip install ultralytics
 it supports only python 3.10
