@@ -11,5 +11,7 @@ urlpatterns = [
     path('Stop_camera/<int:cam_id>', stop_camera, name='stop_camera'),
     path('stop_all_cameras/', stop_all_cameras, name='stop_all_cameras'),
     path('Computational/<int:cam_id>',Computational,name='Computational'),
+    path('mutltioutput_computational/', mutltioutput_computational, name='mutltioutput_computational'),
+    path('camera-zoom/<int:cam_id>/', camera_zoom_control, name='camera_zoom_control'),
 
 ]

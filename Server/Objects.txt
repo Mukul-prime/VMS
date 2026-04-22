@@ -1,0 +1,566 @@
+import cv2
+import os
+import time
+import re
+import statistics
+from datetime import timedelta
+from collections import Counter
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from ultralytics import YOLO
+from django.db import close_old_connections
+from django.utils import timezone
+
+from .models import ObjectDetector, verify_data
+from Camera.models import CreateCamera
+
+
+running_cameras = {}
+
+PERFORMANCE_MODE = os.getenv("PERFORMANCE_MODE", "accurate").strip().lower()
+
+if PERFORMANCE_MODE == "accurate":
+    default_candidates = ["yolov8x.pt", "yolov8l.pt", "yolov8m.pt"]
+    default_imgsz = 1280
+    default_conf = 0.25
+    default_interval = 2
+    default_workers = 1
+else:
+    # light mode for fast CPU/GPU usage
+    default_candidates = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"]
+    default_imgsz = 640
+    default_conf = 0.45
+    default_interval = 4
+    default_workers = 1
+
+custom_model = os.getenv("YOLO_MODEL", "").strip()
+MODEL_CANDIDATES = [custom_model] + default_candidates if custom_model else default_candidates
+_loaded_model = None
+for model_name in MODEL_CANDIDATES:
+    try:
+        _loaded_model = YOLO(model_name)
+        print(f"[MODEL] Loaded {model_name}")
+        break
+    except Exception as model_error:
+        print(f"[MODEL ERROR] {model_name}: {model_error}")
+
+if _loaded_model is None:
+    raise RuntimeError("No YOLO model could be loaded (checked yolov8m.pt/yolov8n.pt).")
+
+model = _loaded_model
+BLOCKED_CLASSES = {"person"}
+YOLO_TO_DB_ALIASES = {
+    "backpack": "bagpack",
+}
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", str(default_imgsz)))
+YOLO_CONF = float(os.getenv("YOLO_CONF", str(default_conf)))
+DETECTION_INTERVAL_SECONDS = int(os.getenv("DETECTION_INTERVAL_SECONDS", str(default_interval)))
+INFERENCE_WORKERS = int(os.getenv("INFERENCE_WORKERS", str(default_workers)))
+DB_REFRESH_INTERVAL = int(os.getenv("DB_REFRESH_INTERVAL", "5"))
+SMOOTHING_WINDOW = int(os.getenv("SMOOTHING_WINDOW", "3"))
+YOLO_IOU = float(os.getenv("YOLO_IOU", "0.55"))
+PERSIST_MISS_CYCLES = int(os.getenv("PERSIST_MISS_CYCLES", "3"))
+BOX_PERSIST_MISS_CYCLES = int(os.getenv("BOX_PERSIST_MISS_CYCLES", "2"))
+YOLO_AUGMENT = os.getenv(
+    "YOLO_AUGMENT",
+    "1" if PERFORMANCE_MODE == "accurate" else "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+LAG_INFER_THRESHOLD_SECONDS = float(os.getenv("LAG_INFER_THRESHOLD_SECONDS", "2.2"))
+MIN_RUNTIME_IMGSZ = int(os.getenv("MIN_RUNTIME_IMGSZ", "960"))
+MAX_DRAW_BOXES = int(os.getenv("MAX_DRAW_BOXES", "40"))
+CAPTURE_BUFFER_SIZE = int(os.getenv("CAPTURE_BUFFER_SIZE", "6"))
+REFLECTION_Y_GAP = float(os.getenv("REFLECTION_Y_GAP", "0.03"))
+REFLECTION_X_OVERLAP = float(os.getenv("REFLECTION_X_OVERLAP", "0.65"))
+REFLECTION_CONF_MARGIN = float(os.getenv("REFLECTION_CONF_MARGIN", "0.08"))
+VERIFY_DATA_RETENTION_HOURS = int(os.getenv("VERIFY_DATA_RETENTION_HOURS", "24"))
+VERIFY_DATA_CLEANUP_INTERVAL_SECONDS = int(os.getenv("VERIFY_DATA_CLEANUP_INTERVAL_SECONDS", "600"))
+
+
+def _canonical_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().lower())
+
+
+def _load_db_objects():
+    db_objects = {}
+    for obj in ObjectDetector.objects.all():
+        normalized = _canonical_name(obj.Name)
+        if not normalized or normalized in BLOCKED_CLASSES:
+            continue
+        db_objects.setdefault(normalized, obj)
+    return db_objects
+
+
+def _ordered_labels_by_db(labels, db_objects):
+    """
+    Keep labels in the same order as ObjectDetector table.
+    """
+    seen = set()
+    unique_labels = []
+    for label in labels:
+        if label in seen:
+            continue
+        seen.add(label)
+        unique_labels.append(label)
+    def _db_order_value(name):
+        obj = db_objects.get(name)
+        if not obj:
+            return 10**9
+        return getattr(obj, "Id", getattr(obj, "id", getattr(obj, "pk", 10**9)))
+
+    return sorted(unique_labels, key=_db_order_value)
+
+
+def _normalize_rtsp_url(rtsp_url: str) -> str:
+    if not rtsp_url:
+        return rtsp_url
+    if "rtsp_transport=" in rtsp_url:
+        return rtsp_url
+    sep = "&" if "?" in rtsp_url else "?"
+    return f"{rtsp_url}{sep}rtsp_transport=tcp"
+
+
+def _open_camera_stream(rtsp_url: str):
+    """
+    OpenCV + FFmpeg tuned open. Helps many HEVC RTSP streams.
+    """
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000"
+    )
+    url = _normalize_rtsp_url(rtsp_url)
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, max(1, CAPTURE_BUFFER_SIZE))
+    return cap
+
+
+def _run_inference(frame_small, allowed_classes, infer_cfg):
+    detections = []
+    boxes = []
+    h, w = frame_small.shape[:2]
+    results = model(
+        frame_small,
+        conf=infer_cfg["conf"],
+        iou=infer_cfg["iou"],
+        imgsz=infer_cfg["imgsz"],
+        augment=infer_cfg["augment"],
+        verbose=False,
+    )
+    for r in results:
+        if r.boxes is None:
+            continue
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            raw_label = model.names[cls_id].lower()
+            label = YOLO_TO_DB_ALIASES.get(raw_label, raw_label)
+            label = _canonical_name(label)
+            if label in BLOCKED_CLASSES:
+                continue
+            if label in allowed_classes:
+                detections.append(label)
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                boxes.append({
+                    "label": label,
+                    "x1": max(0.0, min(1.0, x1 / w)),
+                    "y1": max(0.0, min(1.0, y1 / h)),
+                    "x2": max(0.0, min(1.0, x2 / w)),
+                    "y2": max(0.0, min(1.0, y2 / h)),
+                    "conf": float(box.conf[0]),
+                })
+    filtered_boxes = _filter_reflection_boxes(boxes)
+    filtered_detections = [item["label"] for item in filtered_boxes]
+    return filtered_detections, filtered_boxes
+
+
+def _draw_boxes(frame, boxes, max_boxes=40):
+    if not boxes:
+        return
+    frame_h, frame_w = frame.shape[:2]
+    for item in boxes[:max(1, max_boxes)]:
+        x1 = int(item["x1"] * frame_w)
+        y1 = int(item["y1"] * frame_h)
+        x2 = int(item["x2"] * frame_w)
+        y2 = int(item["y2"] * frame_h)
+        label = item.get("label", "object")
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+
+
+def _missing_item_ids(item_name, max_count, current_count):
+    return [f"{item_name}_{idx}" for idx in range(current_count + 1, max_count + 1)]
+
+
+def _smooth_counts(history):
+    """
+    Temporal smoothing: keep only objects seen in most recent windows.
+    Reduces random false positives while staying lightweight.
+    """
+    if not history:
+        return Counter()
+
+    majority = max(1, len(history) // 2 + 1)
+    object_presence = Counter()
+    count_samples = {}
+
+    for counts in history:
+        for name, count in counts.items():
+            if count > 0:
+                object_presence[name] += 1
+                count_samples.setdefault(name, []).append(count)
+
+    smoothed = Counter()
+    for name, seen_in_windows in object_presence.items():
+        if seen_in_windows >= majority:
+            samples = count_samples.get(name, [])
+            if samples:
+                smoothed[name] = max(1, int(round(statistics.median(samples))))
+    return smoothed
+
+
+def _x_overlap_ratio(box_a, box_b):
+    left = max(box_a["x1"], box_b["x1"])
+    right = min(box_a["x2"], box_b["x2"])
+    inter_w = max(0.0, right - left)
+    base_w = max(1e-6, min(box_a["x2"] - box_a["x1"], box_b["x2"] - box_b["x1"]))
+    return inter_w / base_w
+
+
+def _filter_reflection_boxes(boxes):
+    """
+    Remove lower-confidence mirrored boxes likely coming from floor/glass reflection.
+    """
+    if not boxes:
+        return []
+
+    kept = []
+    for box in sorted(boxes, key=lambda b: b.get("conf", 0.0), reverse=True):
+        is_reflection = False
+        for anchor in kept:
+            if box["label"] != anchor["label"]:
+                continue
+            if box["y1"] <= anchor["y1"]:
+                continue
+            x_overlap = _x_overlap_ratio(box, anchor)
+            y_gap = box["y1"] - anchor["y2"]
+            if (
+                x_overlap >= REFLECTION_X_OVERLAP
+                and y_gap >= -0.02
+                and y_gap <= REFLECTION_Y_GAP
+                and box.get("conf", 0.0) + REFLECTION_CONF_MARGIN < anchor.get("conf", 0.0)
+            ):
+                is_reflection = True
+                break
+        if not is_reflection:
+            kept.append(box)
+    return kept
+
+
+def _apply_count_persistence(smoothed_counts, persisted_counts, missing_streaks, hold_cycles):
+    """
+    Keep last seen counts alive for a few cycles so labels do not flicker.
+    """
+    stable_counts = Counter()
+    current_labels = set(smoothed_counts.keys())
+    remembered_labels = set(persisted_counts.keys())
+
+    for label in current_labels | remembered_labels:
+        new_count = smoothed_counts.get(label, 0)
+        old_count = persisted_counts.get(label, 0)
+
+        if new_count > 0:
+            stable_counts[label] = new_count
+            missing_streaks[label] = 0
+            continue
+
+        miss_count = missing_streaks.get(label, 0) + 1
+        missing_streaks[label] = miss_count
+        if old_count > 0 and miss_count <= max(1, hold_cycles):
+            stable_counts[label] = old_count
+
+    for label in list(missing_streaks.keys()):
+        if label not in stable_counts and missing_streaks[label] > max(1, hold_cycles):
+            del missing_streaks[label]
+
+    return stable_counts
+
+
+def _merge_boxes_with_persistence(new_boxes, persisted_boxes, box_missing_streaks, hold_cycles):
+    """
+    Keep last known box of a label for a few cycles when detector misses it.
+    """
+    latest_by_label = {}
+    for box in new_boxes:
+        latest_by_label[box["label"]] = box
+
+    merged = []
+    active_labels = set(latest_by_label.keys()) | set(persisted_boxes.keys())
+    for label in active_labels:
+        if label in latest_by_label:
+            persisted_boxes[label] = latest_by_label[label]
+            box_missing_streaks[label] = 0
+            merged.append(latest_by_label[label])
+            continue
+
+        miss_count = box_missing_streaks.get(label, 0) + 1
+        box_missing_streaks[label] = miss_count
+        if miss_count <= max(1, hold_cycles) and label in persisted_boxes:
+            merged.append(persisted_boxes[label])
+        else:
+            persisted_boxes.pop(label, None)
+
+    for label in list(box_missing_streaks.keys()):
+        if label not in persisted_boxes:
+            del box_missing_streaks[label]
+
+    return merged
+
+
+def run_camera_detection(cam_id, stop_event):
+    print(f"[START] Camera {cam_id}")
+    print(
+        "[MODE]",
+        {
+            "performance": PERFORMANCE_MODE,
+            "imgsz": YOLO_IMGSZ,
+            "conf": YOLO_CONF,
+            "iou": YOLO_IOU,
+            "augment": YOLO_AUGMENT,
+            "interval_s": DETECTION_INTERVAL_SECONDS,
+            "workers": INFERENCE_WORKERS,
+        },
+    )
+
+    cam = CreateCamera.objects.filter(Cam_id=cam_id).first()
+    if not cam:
+        print(f"[ERROR] Camera {cam_id} not found in DB")
+        return
+
+    rtsp_url = cam.rstp_url
+
+    cap = _open_camera_stream(rtsp_url)
+
+    if not cap.isOpened():
+        print(f"[ERROR] Camera {cam_id} not opened")
+        return
+
+    # Load DB objects (runtime refresh)
+    db_objects = _load_db_objects()
+    db_names_set = set(db_objects.keys())
+    last_db_refresh = time.time()
+
+    print("[DB OBJECTS]:", db_names_set)
+
+    last_db_update = time.time()
+    last_cleanup_at = 0
+    next_detection_at = time.time()
+    runtime_imgsz = YOLO_IMGSZ
+    runtime_interval = max(1, DETECTION_INTERVAL_SECONDS)
+    runtime_augment = YOLO_AUGMENT
+
+    #  Blink fix cache
+    last_detected_names = []
+    last_detected_boxes = []
+    last_counts = Counter()
+    persisted_counts = Counter()
+    count_missing_streaks = Counter()
+    max_seen_counts = Counter()
+    missing_counts = Counter()
+    counts_history = deque(maxlen=max(1, SMOOTHING_WINDOW))
+    persisted_boxes = {}
+    box_missing_streaks = Counter()
+    inference_future = None
+    inference_started_at = None
+    executor = ThreadPoolExecutor(max_workers=max(1, INFERENCE_WORKERS))
+    #  GUI Window (Resizable with close/minimize)
+    window_name = f"Camera {cam_id}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+
+        if not ret or frame is None:
+            print(f"[ERROR] Camera {cam_id} frame failed → reconnecting...")
+            cap.release()
+            time.sleep(1)
+            cap = _open_camera_stream(rtsp_url)
+            continue
+
+        # Keep allowed object names fresh while app is running.
+        if time.time() - last_db_refresh >= DB_REFRESH_INTERVAL:
+            refreshed_objects = _load_db_objects()
+            if refreshed_objects:
+                db_objects = refreshed_objects
+                db_names_set = set(db_objects.keys())
+                print(f"[DB REFRESH] {db_names_set}")
+            last_db_refresh = time.time()
+
+        # Periodic cleanup: remove stale verify_data records older than retention window.
+        if time.time() - last_cleanup_at >= max(60, VERIFY_DATA_CLEANUP_INTERVAL_SECONDS):
+            cutoff = timezone.now() - timedelta(hours=max(1, VERIFY_DATA_RETENTION_HOURS))
+            deleted_count, _ = verify_data.objects.filter(updated_at__lt=cutoff).delete()
+            if deleted_count:
+                print(f"[CLEANUP] Deleted {deleted_count} stale verify_data rows older than {cutoff}")
+            last_cleanup_at = time.time()
+
+        # Pick up async inference results when ready.
+        if inference_future is not None and inference_future.done():
+            try:
+                detected_names, detected_boxes = inference_future.result()
+            except Exception as infer_error:
+                print(f"[INFERENCE ERROR] {infer_error}")
+                detected_names = []
+                detected_boxes = []
+            inference_elapsed = 0.0
+            if inference_started_at is not None:
+                inference_elapsed = time.time() - inference_started_at
+            if inference_elapsed > LAG_INFER_THRESHOLD_SECONDS:
+                runtime_augment = False
+                runtime_imgsz = max(MIN_RUNTIME_IMGSZ, runtime_imgsz - 160)
+                runtime_interval = min(6, runtime_interval + 1)
+                print(
+                    f"[LAG GUARD] infer={inference_elapsed:.2f}s -> "
+                    f"imgsz={runtime_imgsz}, augment={runtime_augment}, interval={runtime_interval}s"
+                )
+            inference_future = None
+            inference_started_at = None
+            last_detected_names = detected_names
+            last_detected_boxes = _merge_boxes_with_persistence(
+                detected_boxes,
+                persisted_boxes,
+                box_missing_streaks,
+                BOX_PERSIST_MISS_CYCLES,
+            )
+            raw_counts = Counter(last_detected_names)
+            counts_history.append(raw_counts)
+            last_counts = _smooth_counts(counts_history)
+            if not last_counts and raw_counts:
+                # bootstrap phase: avoid empty smoothing in first detections
+                last_counts = raw_counts
+            last_counts = _apply_count_persistence(
+                last_counts,
+                persisted_counts,
+                count_missing_streaks,
+                PERSIST_MISS_CYCLES,
+            )
+            persisted_counts = Counter(last_counts)
+
+            for item_name, item_count in last_counts.items():
+                if item_count > max_seen_counts[item_name]:
+                    max_seen_counts[item_name] = item_count
+
+            missing_counts = Counter()
+            for item_name, max_count in max_seen_counts.items():
+                current_count = last_counts.get(item_name, 0)
+                if max_count > current_count:
+                    missing_counts[item_name] = max_count - current_count
+
+            if last_detected_names:
+                ordered_detected = _ordered_labels_by_db(last_detected_names, db_objects)
+                print(f"[DETECTED] {ordered_detected}")
+                print(f"[COUNTS RAW] {dict(raw_counts)}")
+                print(f"[COUNTS SMOOTH] {dict(last_counts)}")
+            if missing_counts:
+                print(f"[MISSING] {dict(missing_counts)}")
+                for item_name, missing_count in missing_counts.items():
+                    max_count = max_seen_counts.get(item_name, 0)
+                    current_count = max_count - missing_count
+                    print(f"[MISSING IDS] {item_name}: {_missing_item_ids(item_name, max_count, current_count)}")
+
+        # Submit inference every N seconds.
+        if inference_future is None and time.time() >= next_detection_at:
+            frame_small = frame
+            infer_cfg = {
+                "conf": YOLO_CONF,
+                "iou": YOLO_IOU,
+                "imgsz": runtime_imgsz,
+                "augment": runtime_augment,
+            }
+            inference_started_at = time.time()
+            inference_future = executor.submit(_run_inference, frame_small, db_names_set, infer_cfg)
+            next_detection_at = time.time() + runtime_interval
+
+        #  DB SAVE (SAFE + OPTIMIZED)
+        if time.time() - last_db_update > max(1, DETECTION_INTERVAL_SECONDS):
+
+            close_old_connections()
+
+            if last_counts:
+                matched = db_names_set & set(last_counts.keys())
+                ordered_matched = _ordered_labels_by_db(list(matched), db_objects)
+                counts = last_counts
+
+                print(f"[MATCHED] {ordered_matched}")
+                print(f"[COUNTS] {counts}")
+
+                for obj_name in ordered_matched:
+                    try:
+                        obj_ref = db_objects[obj_name]
+
+                        obj, created = verify_data.objects.update_or_create(
+                            ObjectRef=obj_ref,
+                            CamRef=cam,
+                            defaults={
+                                "Verified": True,
+                                "count": counts[obj_name]
+                            }
+                        )
+
+                        print(f"[SAVED] {obj_name} → {counts[obj_name]} | Created={created}")
+
+                    except Exception as e:
+                        print(f"[DB ERROR] {e}")
+
+            else:
+                print("[INFO] No detection → DB skip")
+
+            last_db_update = time.time()
+
+        #  Overlay text (stable)
+        if last_detected_names:
+            ordered_detected = _ordered_labels_by_db(last_detected_names, db_objects)
+            text = ", ".join(ordered_detected)
+            cv2.putText(frame, text, (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (0, 255, 0), 2)
+        if missing_counts:
+            missing_text = ", ".join(
+                f"{name} x{count}" for name, count in sorted(missing_counts.items())
+            )
+            cv2.putText(
+                frame,
+                f"MISSING: {missing_text}",
+                (30, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 0, 255),
+                2,
+            )
+        _draw_boxes(frame, last_detected_boxes, MAX_DRAW_BOXES)
+
+        cv2.imshow(window_name, frame)
+
+        # Window close detect
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            print("Window closed")
+            break
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+        time.sleep(0.01)
+
+    if inference_future is not None:
+        inference_future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+    cap.release()
+    cv2.destroyAllWindows()
+
+    print(f"[STOP] Camera {cam_id}")
