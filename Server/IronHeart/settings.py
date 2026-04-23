@@ -11,6 +11,7 @@ SECRET_KEY = "django-insecure-+6mkavww#95$9+86$t)%aj5e1f(_5ph#$-x1%-^*6o4e-y(m$i
 DEBUG = True
 
 ALLOWED_HOSTS = ["*"]  # ✅ Fixed: localhost allow karo
+ALLOWED_HOSTS = ["*"]  # ✅ Fixed: localhost allow karo
 
 
 # Application definition
