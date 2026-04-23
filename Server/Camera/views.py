@@ -87,10 +87,18 @@ def stream_camera(request, cam_id):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    return StreamingHttpResponse(
+    response = StreamingHttpResponse(
         generate_frames(cam.rstp_url),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+    # ✅ Streaming ke liye zaroori headers
+    response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response["Pragma"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    response["Access-Control-Allow-Origin"] = "*"
+
+    return response
 
 
 @api_view(["DELETE"])
