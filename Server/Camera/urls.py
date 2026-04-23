@@ -12,6 +12,7 @@ urlpatterns = [
     path('stop_all_cameras/', stop_all_cameras, name='stop_all_cameras'),
     path('Computational/<int:cam_id>',Computational,name='Computational'),
     path('mutltioutput_computational/', mutltioutput_computational, name='mutltioutput_computational'),
+    path('camera-service-status/', camera_service_status, name='camera_service_status'),
     path('camera-zoom/<int:cam_id>/', camera_zoom_control, name='camera_zoom_control'),
 
 ]

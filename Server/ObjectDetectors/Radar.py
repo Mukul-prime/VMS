@@ -36,7 +36,10 @@ TRACK_STALE_FRAME_TOLERANCE = int(os.getenv("RADAR_TRACK_STALE_FRAMES", "6"))
 COUNT_SMOOTH_WINDOW = int(os.getenv("RADAR_COUNT_SMOOTH_WINDOW", "7"))
 YOLO_CONFIDENCE = float(os.getenv("RADAR_YOLO_CONF", "0.35"))
 YOLO_IOU = float(os.getenv("RADAR_YOLO_IOU", "0.55"))
-GLOBAL_ASSOCIATION_MAX_WORLD_DIST = float(os.getenv("GLOBAL_ASSOCIATION_MAX_WORLD_DIST", "0.08"))
+GLOBAL_ASSOCIATION_MAX_WORLD_DIST = float(os.getenv("GLOBAL_ASSOCIATION_MAX_WORLD_DIST", "0.12"))
+GLOBAL_LOCATION_CELL_SIZE = float(os.getenv("GLOBAL_LOCATION_CELL_SIZE", "0.05"))
+GLOBAL_LOCATION_TTL_SECONDS = float(os.getenv("GLOBAL_LOCATION_TTL_SECONDS", "6.0"))
+GLOBAL_LOCATION_NEIGHBOR_RADIUS = int(os.getenv("GLOBAL_LOCATION_NEIGHBOR_RADIUS", "2"))
 GLOBAL_ASSOCIATION_MAX_AGE_SECONDS = float(os.getenv("GLOBAL_ASSOCIATION_MAX_AGE_SECONDS", "2.5"))
 GLOBAL_TRACK_TTL_SECONDS = float(os.getenv("GLOBAL_TRACK_TTL_SECONDS", "10"))
 GLOBAL_TRACK_MISS_TOLERANCE = int(os.getenv("GLOBAL_TRACK_MISS_TOLERANCE", "3"))
@@ -60,6 +63,7 @@ shared_object_memory_lock = threading.Lock()
 global_tracks_lock = threading.Lock()
 global_tracks = {}
 global_track_seq = 1
+global_location_memory = {}
 
 _model = None
 _model_lock = threading.Lock()
@@ -101,7 +105,7 @@ def _get_model():
         custom_model = os.getenv("YOLO_MODEL", "").strip()
         if custom_model:
             candidates.append(custom_model)
-        candidates.extend(["yolov8m.pt", "yolov8s.pt", "yolov8n.pt"])
+        candidates.extend(["yolov8x.pt", "yolov8l.pt", "yolov8m.pt", "yolov8s.pt", "yolov8n.pt"])
         for name in candidates:
             try:
                 _model = YOLO(name)
@@ -180,20 +184,52 @@ def _project_box_to_world(cam_id, bbox_xyxy):
     return float(mapped[0]), float(mapped[1])
 
 
-def _update_global_unique_count(cam_id, label, world_points, local_count):
+def _world_to_cell(world_point):
+    wx, wy = world_point
+    step = max(0.000001, GLOBAL_LOCATION_CELL_SIZE)
+    return int(round(wx / step)), int(round(wy / step))
+
+
+def _neighbor_cells(cell):
+    cx, cy = cell
+    radius = max(0, int(GLOBAL_LOCATION_NEIGHBOR_RADIUS))
+    cells = []
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            cells.append((cx + dx, cy + dy))
+    return cells
+
+
+def _update_global_unique_count(cam_id, label, track_rows, local_count):
     global global_track_seq
     now = time.time()
+    world_rows = [row for row in track_rows if row.get("world_point") is not None]
 
-    if not world_points:
+    if not world_rows:
+        # Strict mode: no world mapping means no new unique object creation.
+        # Use only already-active global tracks for this label.
+        active = 0
+        with global_tracks_lock:
+            for track in global_tracks.values():
+                if track["label"] != label:
+                    continue
+                age = now - track["last_seen"]
+                if age <= max(0.3, GLOBAL_ASSOCIATION_MAX_AGE_SECONDS):
+                    active += 1
+        fallback_count = int(active)
         with shared_object_memory_lock:
             shared_object_memory[label] = {
-                "count": int(local_count),
+                "count": fallback_count,
                 "last_updated": now,
                 "last_camera_id": int(cam_id),
             }
-        return int(local_count)
+        return fallback_count
 
     with global_tracks_lock:
+        for mem_key in list(global_location_memory.keys()):
+            if now - global_location_memory[mem_key]["last_seen"] > max(0.3, GLOBAL_LOCATION_TTL_SECONDS):
+                del global_location_memory[mem_key]
+
         for track_id in list(global_tracks.keys()):
             if now - global_tracks[track_id]["last_seen"] > max(1.0, GLOBAL_TRACK_TTL_SECONDS):
                 del global_tracks[track_id]
@@ -202,10 +238,29 @@ def _update_global_unique_count(cam_id, label, world_points, local_count):
             if track["label"] == label:
                 track["visited"] = False
 
-        for wx, wy in world_points:
+        for row in world_rows:
+            wx, wy = row["world_point"]
+            row_cell = _world_to_cell((wx, wy))
             best_id = None
             best_dist = None
+
+            # Primary dedup rule: if location cell already exists recently,
+            # reuse same global object instead of creating a new count.
+            for candidate_cell in _neighbor_cells(row_cell):
+                mem_key = (label, candidate_cell[0], candidate_cell[1])
+                existing = global_location_memory.get(mem_key)
+                if not existing:
+                    continue
+                if now - existing["last_seen"] > max(0.3, GLOBAL_LOCATION_TTL_SECONDS):
+                    continue
+                candidate_id = int(existing["global_id"])
+                if candidate_id in global_tracks:
+                    best_id = candidate_id
+                    break
+
             for track_id, track in global_tracks.items():
+                if best_id is not None:
+                    break
                 if track["label"] != label:
                     continue
                 age = now - track["last_seen"]
@@ -223,6 +278,7 @@ def _update_global_unique_count(cam_id, label, world_points, local_count):
                 global_tracks[best_id] = {
                     "label": label,
                     "world_point": (wx, wy),
+                    "cell": row_cell,
                     "last_seen": now,
                     "visited": True,
                     "miss_cycles": 0,
@@ -230,9 +286,19 @@ def _update_global_unique_count(cam_id, label, world_points, local_count):
             else:
                 prev_x, prev_y = global_tracks[best_id]["world_point"]
                 global_tracks[best_id]["world_point"] = (0.7 * prev_x + 0.3 * wx, 0.7 * prev_y + 0.3 * wy)
+                global_tracks[best_id]["cell"] = row_cell
                 global_tracks[best_id]["last_seen"] = now
                 global_tracks[best_id]["visited"] = True
                 global_tracks[best_id]["miss_cycles"] = 0
+
+            for candidate_cell in _neighbor_cells(row_cell):
+                mem_key = (label, candidate_cell[0], candidate_cell[1])
+                global_location_memory[mem_key] = {
+                    "global_id": int(best_id),
+                    "last_seen": now,
+                    "camera_id": int(cam_id),
+                }
+            row["global_id"] = int(best_id)
 
         for track in global_tracks.values():
             if track["label"] != label or track.get("visited"):
@@ -268,10 +334,15 @@ def _draw_tracks(frame, tracks_to_draw):
         x1, y1, x2, y2 = item["bbox"]
         label = item["label"]
         tid = item["track_id"]
+        gid = item.get("global_id")
+        if gid is None:
+            track_text = f"{label} #{tid}"
+        else:
+            track_text = f"{label} G{gid} (L{tid})"
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(
             frame,
-            f"{label} #{tid}",
+            track_text,
             (x1, max(20, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -376,7 +447,6 @@ def runner(rtsp_url, cam_id, target_object_name=None, session_key=None):
 
                 tracks = tracker.update_tracks(detections, frame=frame)
                 track_rows = []
-                world_points = []
                 for track in tracks:
                     if not track.is_confirmed():
                         continue
@@ -389,18 +459,21 @@ def runner(rtsp_url, cam_id, target_object_name=None, session_key=None):
                     x2 = max(x1 + 1, x2)
                     y2 = max(y1 + 1, y2)
                     bbox = (x1, y1, x2, y2)
-                    track_rows.append({"track_id": int(track.track_id), "bbox": bbox, "label": target_label})
+                    row = {"track_id": int(track.track_id), "bbox": bbox, "label": target_label, "global_id": None}
                     wp = _project_box_to_world(cam_key, bbox)
-                    if wp is not None:
-                        world_points.append(wp)
+                    row["world_point"] = wp
+                    track_rows.append(row)
 
                 local_count = len({item["track_id"] for item in track_rows})
-                unique_count = _update_global_unique_count(cam_key, target_label, world_points, local_count)
+                unique_count = _update_global_unique_count(cam_key, target_label, track_rows, local_count)
                 count_history.append(unique_count)
                 sorted_counts = sorted(count_history)
                 smoothed_count = sorted_counts[len(sorted_counts) // 2]
                 with frame_lock:
-                    latest_tracks = track_rows
+                    latest_tracks = [
+                        {"track_id": item["track_id"], "bbox": item["bbox"], "label": item["label"], "global_id": item["global_id"]}
+                        for item in track_rows
+                    ]
 
                 if time.time() - last_save >= SAVE_INTERVAL_SEC:
                     last_save = time.time()
