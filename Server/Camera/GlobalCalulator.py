@@ -9,31 +9,22 @@ django.setup()
 from django.utils.timezone import now
 from Camera.models import Persons
 from Camera.utils import calculate_people
+from Camera.custom_code.Calculatorsperosnmax import (
+    get_past_person_global_count,
+    get_present_person_global_count,
+)
 
 
 def calculate_global_count(ids):
-    removed_person_global_count = 0
-    added_person_global_count = 0
-    total_person_global_count = 0
-    past_person_global_count = 0
-    present_person_global_count = 0
+    # Opposite camera logic:
+    # max(1,3) + max(5,4) + cam2 + cam6
+    past_person_global_count = get_past_person_global_count(ids=ids)
+    present_person_global_count = get_present_person_global_count(ids=ids)
 
-    today = now().date()
-
-    cams = Persons.objects.filter(date=today)
-    if ids:
-        cams = cams.filter(Cam_ids_id__in=ids)
-
-    for cam in cams:
-        count = cam.count
-        previous = cam.previous
-
-        result = calculate_people(previous, count)
-        removed_person_global_count += result["removed_person"]
-        added_person_global_count += result["added_person"]
-        total_person_global_count += result["total_person"]
-        past_person_global_count += result["past_person"]
-        present_person_global_count += result["present_person"]
+    result = calculate_people(past_person_global_count, present_person_global_count)
+    removed_person_global_count = result["removed_person"]
+    added_person_global_count = result["added_person"]
+    total_person_global_count = result["total_person"]
 
     return {
         "removed_person_global_count": removed_person_global_count,
