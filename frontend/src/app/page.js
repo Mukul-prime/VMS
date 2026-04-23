@@ -16,7 +16,7 @@ function CameraFeed({ cam, onClick }) {
     e.stopPropagation();
     setError(false);
     if (imgRef.current) {
-      imgRef.current.src = `${streamUrl}?t=${Date.now()}`;
+      imgRef.current.src = `${streamUrl}`;
     }
   };
 
