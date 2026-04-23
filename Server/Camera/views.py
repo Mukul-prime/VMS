@@ -1,15 +1,14 @@
 from rest_framework import status
-from django.http import StreamingHttpResponse
+from django.http import StreamingHttpResponse, JsonResponse
 from . import Mark91
 from .Frames import generate_frames
 from .RunnerData import runner, camera_flags
-from rest_framework.decorators import api_view
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 import threading
 from .models import CreateCamera
 
-# Create your views here.
+
 @api_view(['POST'])
 def add_camera(request):
     rstp_url = request.data.get("rstp_url")
@@ -31,7 +30,6 @@ def add_camera(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-#  get a Camera access by All
 @api_view(['GET'])
 def Get_all_cameras(request):
     cams = CreateCamera.objects.all()
@@ -39,14 +37,25 @@ def Get_all_cameras(request):
     return Response(serializer.data)
 
 
-@api_view(['GET'])
+# ✅ @api_view NAHI lagana — StreamingHttpResponse ke saath kaam nahi karta
 def stream_camera(request, cam_id):
-    cam = CreateCamera.objects.get(Cam_id=cam_id)
+    try:
+        cam = CreateCamera.objects.get(Cam_id=cam_id)
+    except CreateCamera.DoesNotExist:
+        return JsonResponse({"error": "Camera not found"}, status=404)
 
-    return StreamingHttpResponse(
+    response = StreamingHttpResponse(
         generate_frames(cam.rstp_url),
         content_type='multipart/x-mixed-replace; boundary=frame'
     )
+
+    # ✅ Streaming ke liye zaroori headers
+    response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response["Pragma"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    response["Access-Control-Allow-Origin"] = "*"
+
+    return response
 
 
 @api_view(['DELETE'])
@@ -59,10 +68,6 @@ def DeleteCameras(request, cam_id):
 
 
 running_cameras = {}
-
-
-
-
 
 
 @api_view(['GET'])
@@ -79,7 +84,6 @@ def start_camera(request, cam_id):
             daemon=True
         )
         t.start()
-
         running_cameras[cam_id] = t
 
         return Response({"message": "Camera started"})
@@ -88,26 +92,22 @@ def start_camera(request, cam_id):
         return Response({"message": "Camera not found"})
 
 
-
 @api_view(['GET'])
 def stop_camera(request, cam_id):
     if cam_id not in camera_flags:
         return Response({"message": "Camera not running"})
 
-    camera_flags[cam_id] = False  #  STOP SIGNAL
-
+    camera_flags[cam_id] = False
     return Response({"message": "Camera stopped"})
 
 
 @api_view(['GET'])
 def stop_all_cameras(request):
-
     if not camera_flags:
         return Response({"message": "No cameras running"})
 
     for cam_id in list(camera_flags.keys()):
         camera_flags[cam_id] = False
 
-    camera_flags.clear()   # 🔥 clean memory
-
+    camera_flags.clear()
     return Response({"message": "All cameras stopped and cleared"})
