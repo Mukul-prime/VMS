@@ -194,12 +194,12 @@ export default function Dashboard() {
               </button>
             </div>
 
+            {/* eslint-disable-next-line react-hooks/purity */}
             <img
-                
-              src={`${BASE_URL}/streams/${activeCam}/?t=${Date.now()}`}
-              alt={activeCamData.Cam_name}
-              className="w-full rounded-xl border border-white border-opacity-20"
-              style={{ maxHeight: "80vh", objectFit: "contain" }}
+                src={`${BASE_URL}/streams/${activeCam}/`}
+                alt="camera"
+                className="w-full rounded-xl border border-white border-opacity-20"
+                style={{ maxHeight: "80vh", objectFit: "contain" }}
             />
 
             <p className="text-gray-400 text-xs text-center mt-2">
