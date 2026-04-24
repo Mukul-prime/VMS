@@ -1,10 +1,10 @@
 python -m pip install django
-pip install djangorestframework
-pip install mysqlclient
-pip install face-recognition
-pip install pillow
-pip install opencv-python
-pip install django-cors-headers
-pip install deep-sort-realtime
-pip install ultralytics
+python -m pip install djangorestframework
+python -m pip install mysqlclient
+python -m pip install face-recognition
+python -m pip install pillow
+python -m pip install opencv-python
+python -m pip install django-cors-headers
+python -m pip install deep-sort-realtime
+python -m pip install ultralytics
 it supports only python 3.10
