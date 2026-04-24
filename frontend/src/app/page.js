@@ -195,6 +195,7 @@ export default function Dashboard() {
             </div>
 
             <img
+                
               src={`${BASE_URL}/streams/${activeCam}/?t=${Date.now()}`}
               alt={activeCamData.Cam_name}
               className="w-full rounded-xl border border-white border-opacity-20"
